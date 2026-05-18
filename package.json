@@ -19,6 +19,8 @@
     "format": "prettier -w ."
   },
   "dependencies": {
+    "execa": "^9.6.1",
+    "fast-glob": "^3.3.3",
     "ink": "^7.0.3",
     "react": "^19.2.6"
   },
