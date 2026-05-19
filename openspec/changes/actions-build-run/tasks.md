@@ -27,6 +27,6 @@
 
 ## 5. Smoke check manual
 
-- [ ] 5.1 Probar en un repo con `.xcworkspace` y con `.xcodeproj` que Build corre contra el scheme y simulador seleccionados
-- [ ] 5.2 Probar Build & Run y validar que bootea/instala/lanza, y que los errores se reportan con comando + output
+- [x] 5.1 Probar en un repo con `.xcworkspace` y con `.xcodeproj` que Build corre contra el scheme y simulador seleccionados
+- [x] 5.2 Probar Build & Run y validar que bootea/instala/lanza, y que los errores se reportan con comando + output
 

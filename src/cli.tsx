@@ -11,11 +11,21 @@ import type {SimulatorDevice, XcodeContainer} from './xcode/types.js';
 
 type Focus = 'schemes' | 'simulators' | 'actions';
 type SchemesPanelMode = 'select_container' | 'select_scheme';
+type ViewMode = 'main' | 'logs';
 
 type ActionId = 'build' | 'build_and_run';
 type ActionItem = {
 	id: ActionId;
 	label: string;
+};
+
+type LogSource = 'xcodebuild' | 'simctl' | 'open' | 'app' | 'unknown';
+type LogLevel = 'info' | 'warn' | 'error';
+type LogEntry = {
+	ts: number;
+	source: LogSource;
+	level: LogLevel;
+	message: string;
 };
 
 function clampIndex(index: number, length: number): number {
@@ -138,6 +148,95 @@ function List({
 	);
 }
 
+function formatTime(ts: number): string {
+	const d = new Date(ts);
+	const hh = String(d.getHours()).padStart(2, '0');
+	const mm = String(d.getMinutes()).padStart(2, '0');
+	const ss = String(d.getSeconds()).padStart(2, '0');
+	return `${hh}:${mm}:${ss}`;
+}
+
+function parseLogLine(line: string): LogEntry {
+	const ts = Date.now();
+	const trimmed = line.trimEnd();
+
+	const knownPrefixes: Array<{prefix: string; source: LogSource}> = [
+		{prefix: '[xcodebuild]', source: 'xcodebuild'},
+		{prefix: '[simctl]', source: 'simctl'},
+		{prefix: '[open]', source: 'open'},
+	];
+
+	for (const {prefix, source} of knownPrefixes) {
+		if (trimmed.startsWith(prefix)) {
+			const message = trimmed.slice(prefix.length).trimStart();
+			return {
+				ts,
+				source,
+				level: inferLevel(message),
+				message,
+			};
+		}
+	}
+
+	return {ts, source: 'app', level: inferLevel(trimmed), message: trimmed};
+}
+
+function inferLevel(message: string): LogLevel {
+	const lower = message.toLowerCase();
+	if (lower.includes(' error') || lower.includes('error:') || lower.includes('failed')) {
+		return 'error';
+	}
+	if (lower.includes('warning:') || lower.includes(' warn') || lower.includes('deprecated')) {
+		return 'warn';
+	}
+	return 'info';
+}
+
+function matchesFilter(entry: LogEntry, query: string): boolean {
+	const q = query.trim().toLowerCase();
+	if (q.length === 0) return true;
+	return entry.message.toLowerCase().includes(q);
+}
+
+function LogLine({
+	entry,
+	wrap,
+}: {
+	entry: LogEntry;
+	wrap: 'wrap' | 'truncate-end';
+}) {
+	const sourceStyle =
+		entry.source === 'xcodebuild'
+			? {color: 'cyan' as const}
+			: entry.source === 'simctl'
+				? {color: 'magenta' as const}
+				: entry.source === 'open'
+					? {color: 'yellow' as const}
+					: entry.source === 'app'
+						? {color: 'gray' as const}
+						: {color: 'white' as const};
+
+	const levelStyle =
+		entry.level === 'error'
+			? {color: 'red' as const, dimColor: false}
+			: entry.level === 'warn'
+				? {color: 'yellow' as const, dimColor: false}
+				: {color: undefined, dimColor: true};
+
+	const sourceTag =
+		entry.source === 'unknown' ? 'unknown' : entry.source;
+
+	return (
+		<Text {...levelStyle} wrap={wrap}>
+			<Text dimColor>{formatTime(entry.ts)} </Text>
+			<Text {...sourceStyle} bold>
+				[{sourceTag}]
+			</Text>{' '}
+			{entry.message}
+		</Text>
+	);
+}
+
 function InputLayer({
 	exit,
 	focus,
@@ -165,6 +264,14 @@ function InputLayer({
 	activeContext,
 	isActionRunning,
 	setIsActionRunning,
+	viewMode,
+	setViewMode,
+	logEntriesLength,
+	setLogsScrollOffset,
+	setIsFollowing,
+	isFilterMode,
+	setIsFilterMode,
+	setFilterQuery,
 }: {
 	exit: () => void;
 	focus: Focus;
@@ -192,10 +299,90 @@ function InputLayer({
 	activeContext: ActiveContext | null;
 	isActionRunning: boolean;
 	setIsActionRunning: React.Dispatch<React.SetStateAction<boolean>>;
+	viewMode: ViewMode;
+	setViewMode: React.Dispatch<React.SetStateAction<ViewMode>>;
+	logEntriesLength: number;
+	setLogsScrollOffset: React.Dispatch<React.SetStateAction<number>>;
+	setIsFollowing: React.Dispatch<React.SetStateAction<boolean>>;
+	isFilterMode: boolean;
+	setIsFilterMode: React.Dispatch<React.SetStateAction<boolean>>;
+	setFilterQuery: React.Dispatch<React.SetStateAction<string>>;
 }) {
 	useInput((input, key) => {
-		if (input === 'q' || key.escape) {
+		if (input === 'q') {
 			exit();
+			return;
+		}
+
+		// Logs viewer mode takes over input
+		if (viewMode === 'logs') {
+			if (isFilterMode) {
+				if (key.escape) {
+					setIsFilterMode(false);
+					return;
+				}
+
+				if (key.backspace || key.delete) {
+					setFilterQuery(previous => previous.slice(0, -1));
+					return;
+				}
+
+				if (key.return) {
+					setIsFilterMode(false);
+					return;
+				}
+
+				if (input && !key.ctrl && !key.meta) {
+					setFilterQuery(previous => previous + input);
+				}
+				return;
+			}
+
+			if (key.escape) {
+				setViewMode('main');
+				return;
+			}
+
+			if (input === '/') {
+				setIsFilterMode(true);
+				return;
+			}
+
+			if (input === 'G' || key.end) {
+				setLogsScrollOffset(0);
+				setIsFollowing(true);
+				return;
+			}
+
+			if (key.upArrow) {
+				setLogsScrollOffset(previous => {
+					const next = Math.min(previous + 1, Math.max(0, logEntriesLength));
+					if (next > 0) setIsFollowing(false);
+					return next;
+				});
+				return;
+			}
+
+			if (key.downArrow) {
+				setLogsScrollOffset(previous => {
+					const next = Math.max(0, previous - 1);
+					if (next === 0) setIsFollowing(true);
+					return next;
+				});
+				return;
+			}
+
+			return;
+		}
+
+		// Main view bindings
+		if (key.escape) {
+			exit();
+			return;
+		}
+
+		if (input === 'L' || input === 'l') {
+			setViewMode('logs');
 			return;
 		}
 
@@ -317,13 +504,21 @@ function App() {
 	const {rows} = useWindowSize();
 
 	const [focus, setFocus] = useState<Focus>('schemes');
-	const [logs, setLogs] = useState<string[]>([]);
+	const [viewMode, setViewMode] = useState<ViewMode>('main');
+
+	const maxLogEntries = 2000;
+	const [logEntries, setLogEntries] = useState<LogEntry[]>([]);
 	const addLog = (line: string) => {
-		setLogs(previous => {
-			const next = [...previous, line];
-			return next.length > 200 ? next.slice(-200) : next;
+		setLogEntries(previous => {
+			const next = [...previous, parseLogLine(line)];
+			return next.length > maxLogEntries ? next.slice(-maxLogEntries) : next;
 		});
 	};
+
+	const [logsScrollOffset, setLogsScrollOffset] = useState(0);
+	const [isFollowing, setIsFollowing] = useState(true);
+	const [isFilterMode, setIsFilterMode] = useState(false);
+	const [filterQuery, setFilterQuery] = useState('');
 
 	const [containers, setContainers] = useState<XcodeContainer[]>([]);
 	const [containersIndex, setContainersIndex] = useState(0);
@@ -527,9 +722,14 @@ function App() {
 	const listContentHeight = Math.max(1, mainPanelsHeight - 2 - 2);
 	const logsContentHeight = Math.max(1, logsPanelHeight - 2);
 
+	const filteredEntries = useMemo(
+		() => logEntries.filter(e => matchesFilter(e, filterQuery)),
+		[logEntries, filterQuery],
+	);
+
 	const logsToShow = useMemo(
-		() => logs.slice(-logsContentHeight),
-		[logs, logsContentHeight],
+		() => filteredEntries.slice(-logsContentHeight),
+		[filteredEntries, logsContentHeight],
 	);
 
 	const simulatorVisibleRows = useMemo(() => {
@@ -569,6 +769,25 @@ function App() {
 			? {container: selectedContainer, scheme: selectedScheme, simulatorUdid: selectedSimulatorUdid}
 			: null;
 
+	useEffect(() => {
+		// Keep scroll offset sane when buffer changes
+		setLogsScrollOffset(previous => clampIndex(previous, Math.max(0, filteredEntries.length)));
+	}, [filteredEntries.length]);
+
+	useEffect(() => {
+		if (!isFollowing) return;
+		setLogsScrollOffset(0);
+	}, [filteredEntries.length, isFollowing]);
+
+	const viewerHeaderHeight = 3;
+	const viewerContentHeight = Math.max(1, rows - viewerHeaderHeight - 2);
+	const viewerStart = Math.max(
+		0,
+		filteredEntries.length - viewerContentHeight - logsScrollOffset,
+	);
+	const viewerEnd = Math.min(filteredEntries.length, viewerStart + viewerContentHeight);
+	const viewerVisible = filteredEntries.slice(viewerStart, viewerEnd);
+
 	return (
 		<Box flexDirection="column" padding={1} gap={1}>
 			{isRawModeSupported ? (
@@ -599,168 +818,215 @@ function App() {
 					activeContext={activeContext}
 					isActionRunning={isActionRunning}
 					setIsActionRunning={setIsActionRunning}
+					viewMode={viewMode}
+					setViewMode={setViewMode}
+					logEntriesLength={filteredEntries.length}
+					setLogsScrollOffset={setLogsScrollOffset}
+					setIsFollowing={setIsFollowing}
+					isFilterMode={isFilterMode}
+					setIsFilterMode={setIsFilterMode}
+					setFilterQuery={setFilterQuery}
 				/>
 			) : null}
-			<Box justifyContent="space-between" height={headerHeight}>
-				<Text bold>lazyswift</Text>
-				<Text dimColor>
-					Tab cambia panel · ↑↓ navega · Enter selecciona · q/Esc sale
-				</Text>
-			</Box>
 
-			<Box flexDirection="row" gap={1} height={mainPanelsHeight}>
-				<Panel title={schemesTitle} isFocused={focus === 'schemes'}>
-					{isLoading && <Text dimColor>Cargando…</Text>}
-					<List
-						items={schemesItems}
-						selectedIndex={schemesSelectedIndex}
-						emptyLabel={schemesEmptyLabel}
-						maxVisibleRows={listContentHeight}
-					/>
-				</Panel>
-				<Panel title="Simulators" isFocused={focus === 'simulators'}>
-					{simulatorGroups.length === 0 ? (
-						<Text dimColor>No hay simuladores disponibles.</Text>
-					) : (
-						<Box flexDirection="column">
-							{(() => {
-								const windowSize = Math.max(1, listContentHeight);
-								const start = getWindowStartIndex({
-									total: simulatorVisibleRows.length,
-									windowSize,
-									selectedIndex: simulatorIndex,
-								});
-								const end = Math.min(simulatorVisibleRows.length, start + windowSize);
-								const visible = simulatorVisibleRows.slice(start, end);
-
-								return (
-									<>
-										{visible.map((row, relativeIndex) => {
-											const rowIndex = start + relativeIndex;
-								const isFocused = focus === 'simulators';
-								const isCursor = rowIndex === simulatorIndex;
-								const showCursor = isFocused && isCursor;
-
-								if (row.kind === 'runtime') {
-									const arrow = row.isExpanded ? '▼' : '▶';
-									const marker = showCursor ? '> ' : '  ';
-									return (
-										<Text
-											key={`rt-${row.runtimeId}`}
-											bold
-											color={showCursor ? 'cyan' : undefined}
-											inverse={showCursor}
-										>
-											{marker}
-											{arrow} {row.runtimeLabel}{' '}
-											<Text dimColor>({row.count})</Text>
-										</Text>
-									);
-								}
-
-								const isSelected = row.device.udid === selectedSimulatorUdid;
-								const marker = showCursor ? '> ' : '  ';
-								return (
-									<Text
-										key={row.device.udid}
-										color={showCursor ? 'cyan' : isSelected ? 'green' : undefined}
-										inverse={showCursor}
-									>
-										{marker}
-										{row.device.name}{' '}
-										<Text dimColor>
-											{String(row.device.state ?? 'Unknown')}
-										</Text>
-									</Text>
-								);
-							})}
-										{simulatorVisibleRows.length > windowSize ? (
-											<Text dimColor>
-												{start + 1}-{end} / {simulatorVisibleRows.length}
-											</Text>
-										) : null}
-									</>
-								);
-							})()}
-						</Box>
-					)}
-				</Panel>
-				<Panel title="Actions" isFocused={focus === 'actions'}>
-					<Box flexDirection="column">
-						{actions.length === 0 ? (
+			{viewMode === 'logs' ? (
+				<Box flexDirection="column" flexGrow={1}>
+					<Box justifyContent="space-between">
+						<Text bold>Logs</Text>
+						<Text dimColor>
+							↑↓ scroll · {isFollowing ? 'follow' : 'paused'} · / filter · G/End end · Esc back · q quit
+						</Text>
+					</Box>
+					<Box justifyContent="space-between">
+						<Text dimColor>
+							Mostrando {viewerStart + 1}-{viewerEnd} / {filteredEntries.length}
+						</Text>
+						<Text dimColor>
+							{filterQuery.trim().length > 0 ? `Filter: ${filterQuery}` : 'Filter: —'}
+							{isFilterMode ? ' (typing)' : ''}
+						</Text>
+					</Box>
+					<Box borderStyle="round" borderColor="gray" flexDirection="column" paddingX={1} flexGrow={1}>
+						{viewerVisible.length === 0 ? (
 							<Text dimColor>—</Text>
 						) : (
-							(() => {
-								const windowSize = Math.max(1, listContentHeight);
-								const start = getWindowStartIndex({
-									total: actions.length,
-									windowSize,
-									selectedIndex: actionIndex,
-								});
-								const end = Math.min(actions.length, start + windowSize);
-								const visible = actions.slice(start, end);
-
-								return (
-									<>
-										{visible.map((action, relativeIndex) => {
-											const index = start + relativeIndex;
-											const showCursor = focus === 'actions' && index === actionIndex;
-											const isEnabled = Boolean(activeContext) && !isActionRunning;
-											const marker = showCursor ? '> ' : '  ';
-
-											return (
-												<Text
-													key={action.id}
-													color={showCursor ? 'cyan' : undefined}
-													inverse={showCursor}
-													dimColor={!isEnabled}
-												>
-													{marker}
-													{action.label}
-													{isActionRunning ? (
-														<Text dimColor> (running)</Text>
-													) : null}
-												</Text>
-											);
-										})}
-										{actions.length > windowSize ? (
-											<Text dimColor>
-												{start + 1}-{end} / {actions.length}
-											</Text>
-										) : null}
-									</>
-								);
-							})()
-						)}
-						{activeContext ? (
-							<Text dimColor>OK: scheme+simulator seleccionados</Text>
-						) : (
-							<Text dimColor>Falta: scheme y/o simulador</Text>
+							viewerVisible.map((entry, index) => (
+								<LogLine key={`${entry.ts}-${index}-${entry.message}`} entry={entry} wrap="wrap" />
+							))
 						)}
 					</Box>
-				</Panel>
-			</Box>
-
-			<Box
-				flexDirection="column"
-				borderStyle="round"
-				borderColor="gray"
-				paddingX={1}
-				height={logsPanelHeight}
-			>
-				<Text bold>Logs</Text>
-				<Box flexDirection="column" marginTop={1}>
-					{logsToShow.length === 0 ? (
-						<Text dimColor>—</Text>
-					) : (
-						logsToShow.map((line, index) => (
-							<Text key={`${index}-${line}`} dimColor>
-								{line}
-							</Text>
-						))
-					)}
 				</Box>
-			</Box>
+			) : (
+				<>
+					<Box justifyContent="space-between" height={headerHeight}>
+						<Text bold>lazyswift</Text>
+						<Text dimColor>
+							Tab cambia panel · ↑↓ navega · Enter selecciona · L logs · q/Esc sale
+						</Text>
+					</Box>
+
+					<Box flexDirection="row" gap={1} height={mainPanelsHeight}>
+						<Panel title={schemesTitle} isFocused={focus === 'schemes'}>
+							{isLoading && <Text dimColor>Cargando…</Text>}
+							<List
+								items={schemesItems}
+								selectedIndex={schemesSelectedIndex}
+								emptyLabel={schemesEmptyLabel}
+								maxVisibleRows={listContentHeight}
+							/>
+						</Panel>
+						<Panel title="Simulators" isFocused={focus === 'simulators'}>
+							{simulatorGroups.length === 0 ? (
+								<Text dimColor>No hay simuladores disponibles.</Text>
+							) : (
+								<Box flexDirection="column">
+									{(() => {
+										const windowSize = Math.max(1, listContentHeight);
+										const start = getWindowStartIndex({
+											total: simulatorVisibleRows.length,
+											windowSize,
+											selectedIndex: simulatorIndex,
+										});
+										const end = Math.min(simulatorVisibleRows.length, start + windowSize);
+										const visible = simulatorVisibleRows.slice(start, end);
+
+										return (
+											<>
+												{visible.map((row, relativeIndex) => {
+													const rowIndex = start + relativeIndex;
+													const isFocused = focus === 'simulators';
+													const isCursor = rowIndex === simulatorIndex;
+													const showCursor = isFocused && isCursor;
+
+													if (row.kind === 'runtime') {
+														const arrow = row.isExpanded ? '▼' : '▶';
+														const marker = showCursor ? '> ' : '  ';
+														return (
+															<Text
+																key={`rt-${row.runtimeId}`}
+																bold
+																color={showCursor ? 'cyan' : undefined}
+																inverse={showCursor}
+															>
+																{marker}
+																{arrow} {row.runtimeLabel}{' '}
+																<Text dimColor>({row.count})</Text>
+															</Text>
+														);
+													}
+
+													const isSelected = row.device.udid === selectedSimulatorUdid;
+													const marker = showCursor ? '> ' : '  ';
+													return (
+														<Text
+															key={row.device.udid}
+															color={showCursor ? 'cyan' : isSelected ? 'green' : undefined}
+															inverse={showCursor}
+														>
+															{marker}
+															{row.device.name}{' '}
+															<Text dimColor>
+																{String(row.device.state ?? 'Unknown')}
+															</Text>
+														</Text>
+													);
+												})}
+												{simulatorVisibleRows.length > windowSize ? (
+													<Text dimColor>
+														{start + 1}-{end} / {simulatorVisibleRows.length}
+													</Text>
+												) : null}
+											</>
+										);
+									})()}
+								</Box>
+							)}
+						</Panel>
+						<Panel title="Actions" isFocused={focus === 'actions'}>
+							<Box flexDirection="column">
+								{actions.length === 0 ? (
+									<Text dimColor>—</Text>
+								) : (
+									(() => {
+										const windowSize = Math.max(1, listContentHeight);
+										const start = getWindowStartIndex({
+											total: actions.length,
+											windowSize,
+											selectedIndex: actionIndex,
+										});
+										const end = Math.min(actions.length, start + windowSize);
+										const visible = actions.slice(start, end);
+
+										return (
+											<>
+												{visible.map((action, relativeIndex) => {
+													const index = start + relativeIndex;
+													const showCursor = focus === 'actions' && index === actionIndex;
+													const isEnabled = Boolean(activeContext) && !isActionRunning;
+													const marker = showCursor ? '> ' : '  ';
+
+													return (
+														<Text
+															key={action.id}
+															color={showCursor ? 'cyan' : undefined}
+															inverse={showCursor}
+															dimColor={!isEnabled}
+														>
+															{marker}
+															{action.label}
+															{isActionRunning ? (
+																<Text dimColor> (running)</Text>
+															) : null}
+														</Text>
+													);
+												})}
+												{actions.length > windowSize ? (
+													<Text dimColor>
+														{start + 1}-{end} / {actions.length}
+													</Text>
+												) : null}
+											</>
+										);
+									})()
+								)}
+								{activeContext ? (
+									<Text dimColor>OK: scheme+simulator seleccionados</Text>
+								) : (
+									<Text dimColor>Falta: scheme y/o simulador</Text>
+								)}
+							</Box>
+						</Panel>
+					</Box>
+
+					<Box
+						flexDirection="column"
+						borderStyle="round"
+						borderColor="gray"
+						paddingX={1}
+						height={logsPanelHeight}
+					>
+						<Text bold>
+							Logs
+							{filterQuery.trim().length > 0 ? (
+								<Text dimColor>{` (filter: ${filterQuery})`}</Text>
+							) : null}
+						</Text>
+						<Box flexDirection="column" marginTop={1}>
+							{logsToShow.length === 0 ? (
+								<Text dimColor>—</Text>
+							) : (
+								logsToShow.map((entry, index) => (
+									<LogLine
+										key={`${entry.ts}-${index}-${entry.message}`}
+										entry={entry}
+										wrap="truncate-end"
+									/>
+								))
+							)}
+						</Box>
+					</Box>
+				</>
+			)}
 		</Box>
 	);
 }
