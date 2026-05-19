@@ -2,6 +2,8 @@ import React, {useEffect, useMemo, useState} from 'react';
 import {Box, render, Text, useApp, useInput, useStdin, useWindowSize} from 'ink';
 
 import {findXcodeContainers} from './xcode/find-containers.js';
+import type {ActiveContext} from './xcode/actions.js';
+import {runBuild, runBuildAndRun} from './xcode/actions.js';
 import {listSchemes} from './xcode/list-schemes.js';
 import {listSimulators} from './xcode/list-simulators.js';
 import {runtimeIdToLabel} from './xcode/runtime-label.js';
@@ -9,6 +11,12 @@ import type {SimulatorDevice, XcodeContainer} from './xcode/types.js';
 
 type Focus = 'schemes' | 'simulators' | 'actions';
 type SchemesPanelMode = 'select_container' | 'select_scheme';
+
+type ActionId = 'build' | 'build_and_run';
+type ActionItem = {
+	id: ActionId;
+	label: string;
+};
 
 function clampIndex(index: number, length: number): number {
 	if (length <= 0) return 0;
@@ -143,6 +151,7 @@ function InputLayer({
 	schemes,
 	schemeIndex,
 	setSchemeIndex,
+	setSelectedScheme,
 	addLog,
 	simulatorRowsLength,
 	simulatorIndex,
@@ -150,6 +159,12 @@ function InputLayer({
 	getSimulatorRowByIndex,
 	setExpandedRuntimeId,
 	setSelectedSimulatorUdid,
+	actions,
+	actionIndex,
+	setActionIndex,
+	activeContext,
+	isActionRunning,
+	setIsActionRunning,
 }: {
 	exit: () => void;
 	focus: Focus;
@@ -163,6 +178,7 @@ function InputLayer({
 	schemes: string[];
 	schemeIndex: number;
 	setSchemeIndex: React.Dispatch<React.SetStateAction<number>>;
+	setSelectedScheme: React.Dispatch<React.SetStateAction<string | null>>;
 	addLog: (line: string) => void;
 	simulatorRowsLength: number;
 	simulatorIndex: number;
@@ -170,6 +186,12 @@ function InputLayer({
 	getSimulatorRowByIndex: (index: number) => SimulatorVisibleRow | undefined;
 	setExpandedRuntimeId: React.Dispatch<React.SetStateAction<string | null>>;
 	setSelectedSimulatorUdid: React.Dispatch<React.SetStateAction<string | null>>;
+	actions: ActionItem[];
+	actionIndex: number;
+	setActionIndex: React.Dispatch<React.SetStateAction<number>>;
+	activeContext: ActiveContext | null;
+	isActionRunning: boolean;
+	setIsActionRunning: React.Dispatch<React.SetStateAction<boolean>>;
 }) {
 	useInput((input, key) => {
 		if (input === 'q' || key.escape) {
@@ -183,6 +205,43 @@ function InputLayer({
 				if (previous === 'simulators') return 'actions';
 				return 'schemes';
 			});
+			return;
+		}
+
+		if (focus === 'actions') {
+			if (key.upArrow) {
+				setActionIndex(previous => clampIndex(previous - 1, actions.length));
+			} else if (key.downArrow) {
+				setActionIndex(previous => clampIndex(previous + 1, actions.length));
+			} else if (key.return) {
+				const action = actions[actionIndex];
+				if (!action) return;
+
+				if (isActionRunning) {
+					addLog('Hay una acción en curso. Esperá a que termine.');
+					return;
+				}
+
+				if (!activeContext) {
+					addLog('Acción deshabilitada: seleccioná scheme y simulador.');
+					return;
+				}
+
+				setIsActionRunning(true);
+				void (async () => {
+					try {
+						if (action.id === 'build') {
+							await runBuild(activeContext, {addLog, cwd: process.cwd()});
+						} else if (action.id === 'build_and_run') {
+							await runBuildAndRun(activeContext, {addLog, cwd: process.cwd()});
+						}
+					} catch (error) {
+						addLog(`Acción falló: ${String(error)}`);
+					} finally {
+						setIsActionRunning(false);
+					}
+				})();
+			}
 			return;
 		}
 
@@ -240,8 +299,12 @@ function InputLayer({
 			setSchemeIndex(previous => clampIndex(previous + 1, schemes.length));
 		} else if (key.return) {
 			const scheme = schemes[schemeIndex];
-			if (scheme) addLog(`Scheme seleccionado: ${scheme}`);
-			else addLog('No hay scheme seleccionado.');
+			if (scheme) {
+				setSelectedScheme(scheme);
+				addLog(`Scheme activo: ${scheme}`);
+			} else {
+				addLog('No hay scheme seleccionado.');
+			}
 		}
 	});
 
@@ -270,6 +333,7 @@ function App() {
 
 	const [schemes, setSchemes] = useState<string[]>([]);
 	const [schemeIndex, setSchemeIndex] = useState(0);
+	const [selectedScheme, setSelectedScheme] = useState<string | null>(null);
 	const [schemesPanelMode, setSchemesPanelMode] =
 		useState<SchemesPanelMode>('select_container');
 
@@ -279,6 +343,16 @@ function App() {
 	const [selectedSimulatorUdid, setSelectedSimulatorUdid] = useState<string | null>(
 		null,
 	);
+
+	const actions: ActionItem[] = useMemo(
+		() => [
+			{id: 'build', label: 'Build'},
+			{id: 'build_and_run', label: 'Build & Run'},
+		],
+		[],
+	);
+	const [actionIndex, setActionIndex] = useState(0);
+	const [isActionRunning, setIsActionRunning] = useState(false);
 
 	const [isLoading, setIsLoading] = useState(false);
 	const containerLabels = useMemo(
@@ -393,11 +467,13 @@ function App() {
 				if (result.stderr) addLog(result.stderr);
 				setSchemes([]);
 				setSchemeIndex(0);
+				setSelectedScheme(null);
 				return;
 			}
 
 			setSchemes(result.schemes);
 			setSchemeIndex(0);
+			setSelectedScheme(null);
 			addLog(`Schemes: ${result.schemes.length}`);
 		})()
 			.catch(error => {
@@ -414,6 +490,10 @@ function App() {
 	}, [selectedContainer]);
 
 	useEffect(() => {
+		setActionIndex(previous => clampIndex(previous, actions.length));
+	}, [actions.length]);
+
+	useEffect(() => {
 		if (!isRawModeSupported) {
 			addLog(
 				'Input deshabilitado: stdin no soporta raw mode (corré lazyswift desde una terminal real).',
@@ -422,7 +502,11 @@ function App() {
 	}, [isRawModeSupported]);
 
 	const schemesTitle =
-		schemesPanelMode === 'select_container' ? 'Schemes (contenedor)' : 'Schemes';
+		schemesPanelMode === 'select_container'
+			? 'Schemes (contenedor)'
+			: selectedScheme
+				? `Schemes (active: ${selectedScheme})`
+				: 'Schemes';
 	const schemesItems =
 		schemesPanelMode === 'select_container' ? containerLabels : schemes;
 	const schemesSelectedIndex =
@@ -480,6 +564,11 @@ function App() {
 
 	const getSimulatorRowByIndex = (index: number) => simulatorVisibleRows[index];
 
+	const activeContext: ActiveContext | null =
+		selectedContainer && selectedScheme && selectedSimulatorUdid
+			? {container: selectedContainer, scheme: selectedScheme, simulatorUdid: selectedSimulatorUdid}
+			: null;
+
 	return (
 		<Box flexDirection="column" padding={1} gap={1}>
 			{isRawModeSupported ? (
@@ -496,6 +585,7 @@ function App() {
 					schemes={schemes}
 					schemeIndex={schemeIndex}
 					setSchemeIndex={setSchemeIndex}
+					setSelectedScheme={setSelectedScheme}
 					addLog={addLog}
 					simulatorRowsLength={simulatorVisibleRows.length}
 					simulatorIndex={simulatorIndex}
@@ -503,6 +593,12 @@ function App() {
 					getSimulatorRowByIndex={getSimulatorRowByIndex}
 					setExpandedRuntimeId={setExpandedRuntimeId}
 					setSelectedSimulatorUdid={setSelectedSimulatorUdid}
+					actions={actions}
+					actionIndex={actionIndex}
+					setActionIndex={setActionIndex}
+					activeContext={activeContext}
+					isActionRunning={isActionRunning}
+					setIsActionRunning={setIsActionRunning}
 				/>
 			) : null}
 			<Box justifyContent="space-between" height={headerHeight}>
@@ -590,7 +686,58 @@ function App() {
 					)}
 				</Panel>
 				<Panel title="Actions" isFocused={focus === 'actions'}>
-					<Text dimColor>(próximo) Build · Test · Boot · Logs</Text>
+					<Box flexDirection="column">
+						{actions.length === 0 ? (
+							<Text dimColor>—</Text>
+						) : (
+							(() => {
+								const windowSize = Math.max(1, listContentHeight);
+								const start = getWindowStartIndex({
+									total: actions.length,
+									windowSize,
+									selectedIndex: actionIndex,
+								});
+								const end = Math.min(actions.length, start + windowSize);
+								const visible = actions.slice(start, end);
+
+								return (
+									<>
+										{visible.map((action, relativeIndex) => {
+											const index = start + relativeIndex;
+											const showCursor = focus === 'actions' && index === actionIndex;
+											const isEnabled = Boolean(activeContext) && !isActionRunning;
+											const marker = showCursor ? '> ' : '  ';
+
+											return (
+												<Text
+													key={action.id}
+													color={showCursor ? 'cyan' : undefined}
+													inverse={showCursor}
+													dimColor={!isEnabled}
+												>
+													{marker}
+													{action.label}
+													{isActionRunning ? (
+														<Text dimColor> (running)</Text>
+													) : null}
+												</Text>
+											);
+										})}
+										{actions.length > windowSize ? (
+											<Text dimColor>
+												{start + 1}-{end} / {actions.length}
+											</Text>
+										) : null}
+									</>
+								);
+							})()
+						)}
+						{activeContext ? (
+							<Text dimColor>OK: scheme+simulator seleccionados</Text>
+						) : (
+							<Text dimColor>Falta: scheme y/o simulador</Text>
+						)}
+					</Box>
 				</Panel>
 			</Box>
 

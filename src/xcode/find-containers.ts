@@ -21,6 +21,7 @@ export async function findXcodeContainers({
 		ignore: [
 			'**/node_modules/**',
 			'**/.git/**',
+			'**/.lazyswift/**',
 			'**/DerivedData/**',
 			'**/build/**',
 			'**/.build/**',
