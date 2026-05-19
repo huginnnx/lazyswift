@@ -102,6 +102,30 @@ export async function runBuildAndRun(context: ActiveContext, io: ActionIO) {
 	io.addLog('Build & Run: preparando simulador…');
 
 	{
+		// `simctl` puede bootear el device aunque Simulator.app no esté abierto.
+		// Abrimos Simulator.app para que el usuario vea el simulador levantado.
+		const result = await runStreamed({
+			prefix: '[open]',
+			file: 'open',
+			args: [
+				'-a',
+				'Simulator',
+				'--args',
+				'-CurrentDeviceUDID',
+				context.simulatorUdid,
+			],
+			cwd: io.cwd,
+			addLog: io.addLog,
+		});
+
+		if (!result.ok) {
+			io.addLog(
+				`Warning: no se pudo abrir Simulator.app (exitCode ${result.exitCode ?? '—'})`,
+			);
+		}
+	}
+
+	{
 		const result = await runStreamed({
 			prefix: '[simctl]',
 			file: 'xcrun',
